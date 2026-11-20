@@ -1,9 +1,6 @@
 name: Rust agent migration
 on:
   workflow_dispatch:
-  push:
-    branches: [codex/rust-live-cutover]
-    paths: ['control/migration/**', 'control/test/rust-agent-hot-migration.py', '.github/workflows/rust-migration.yml']
 permissions:
   contents: read
 concurrency:

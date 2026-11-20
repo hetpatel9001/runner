@@ -1,4 +1,4 @@
-import { capacityInterval, reconcileCapacity, refillSlot, targetCount } from '../../.github/scripts/capacity.mjs';
+import { capacityInterval, reconcileCapacity, refillSlot, signProviderRequest, targetCount } from '../../.github/scripts/capacity.mjs';
 export { refillSlot } from '../../.github/scripts/capacity.mjs';
 
 // Only a verified primary calls this. The committed claim covers the API
@@ -18,6 +18,7 @@ export async function replenish(provider, { api, authority, claim, now = Date.no
   const repository = await api(base);
   if (!repository.default_branch || repository.archived || repository.disabled) throw new Error('provider repository unavailable');
   const ref = repository.default_branch;
+  const signature = signProviderRequest(provider.repo, ref, String(slot), provider.dispatchKey);
   const plan = await reconcileCapacity({ ...vars, GITHUB_REPOSITORY: provider.repo, MACHINE_REF: ref,
     GITHUB_EVENT_NAME: 'provider_preview', CAPACITY_DRY_RUN: '1' }, { api, now, log });
   Object.assign(result, { reserved: plan.active, missing: plan.missing, aging: plan.aging, slot });
@@ -34,7 +35,7 @@ export async function replenish(provider, { api, authority, claim, now = Date.no
   if (!committed.accepted) return { ...result, action: 'already_claimed' };
   await authority.check(fence);
   await api(base + '/actions/workflows/watchdog.yml/dispatches', {
-    method: 'POST', body: { ref, inputs: { refill_slot: String(slot) } },
+    method: 'POST', body: { ref, inputs: { refill_slot: String(slot), provider_signature: signature } },
   });
   return { ...result, action: 'requested' };
 }

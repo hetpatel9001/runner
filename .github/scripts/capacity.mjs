@@ -1,11 +1,25 @@
-// Each repository's serialized workflow owns launch accounting. It can be
-// woken by its schedule or by the optional replicated provider application.
+// Each repository's serialized workflow accounts for launches requested by
+// the replicated Fleet Provider. Other invocation contexts can only preview.
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 
 export const ACTIVE_STATUSES = ["requested", "pending", "waiting", "queued", "in_progress"];
 const LAUNCH_SPACING_MS = 10 * 60_000;
 const RENEW_AFTER_MS = 210 * 60_000;
+
+export function signProviderRequest(repo, ref, slot, key) {
+  if (!/^[a-f0-9]{64}$/.test(key || "")) throw new Error("a private Fleet Provider dispatch key is required");
+  return createHmac("sha256", Buffer.from(key, "hex"))
+    .update(`fleet-provider-v1\n${repo.toLowerCase()}\n${ref}\n${slot}\n`).digest("hex");
+}
+
+export function verifyProviderRequest(repo, ref, slot, key, signature) {
+  if (!/^[a-f0-9]{64}$/.test(signature || "")) throw new Error("a signed Fleet Provider request is required");
+  const expected = signProviderRequest(repo, ref, slot, key);
+  if (!timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(signature, "hex")))
+    throw new Error("invalid Fleet Provider request signature");
+}
 
 export function capacityInterval(env) {
   const value = String(env.CAPACITY_INTERVAL_MIN || '10');
@@ -44,7 +58,7 @@ export function capacityPlan(target, active, recent, now, { spacingMs = LAUNCH_S
     const title = run.display_title || run.name || "";
     const slot = /^machine ([1-9]\d*)$/.exec(title.trim());
     // Preserve accounting for old, overlapping same-slot handovers while the
-    // fleet drains into schedule-only hosts. New jobs each supply one host.
+    // fleet drains into provider-supplied hosts. New jobs each supply one host.
     const key = slot ? `slot:${slot[1]}` : `run:${run.id}`;
     const started = Date.parse(run.run_started_at || run.created_at);
     const aging = run.status === "in_progress" && now - started >= RENEW_AFTER_MS;
@@ -63,7 +77,8 @@ export function capacityPlan(target, active, recent, now, { spacingMs = LAUNCH_S
 export function githubClient(token, base = "https://api.github.com", fetcher = fetch) {
   const origin = new URL(base);
   if (origin.protocol !== "https:" || origin.username || origin.password || origin.search || origin.hash) throw new Error("invalid GitHub API URL");
-  return async (path, { method = "GET", body } = {}) => {
+  let quota = {};
+  const api = async (path, { method = "GET", body } = {}) => {
     const response = await fetcher(`${base.replace(/\/$/, "")}${path}`, {
       method,
       headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "content-type": "application/json",
@@ -71,9 +86,22 @@ export function githubClient(token, base = "https://api.github.com", fetcher = f
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(20_000),
     });
+    const number = name => {
+      const value = response.headers?.get(name);
+      return value != null && /^\d+$/.test(value) ? Number(value) : null;
+    };
+    const limit = number('x-ratelimit-limit'), remaining = number('x-ratelimit-remaining');
+    const reset = number('x-ratelimit-reset'), retry = response.headers?.get('retry-after');
+    const available = remaining !== null && quota.resetAt === reset * 1000 && Number.isFinite(quota.remaining)
+      ? Math.min(remaining, quota.remaining) : remaining;
+    quota = { ...quota, ...(limit === null ? {} : { limit }), ...(available === null ? {} : { remaining: available }),
+      ...(reset === null ? {} : { resetAt: reset * 1000 }),
+      retryAt: retry ? (/^\d+$/.test(retry) ? Date.now() + Number(retry) * 1000 : Date.parse(retry)) : 0 };
     if (!response.ok) throw new Error(`GitHub ${method} ${path}: HTTP ${response.status}`);
     return response.status === 204 ? null : response.json();
   };
+  api.quota = () => ({ ...quota });
+  return api;
 }
 
 export async function reconcileCapacity(env, { api, now = Date.now, log = console.log } = {}) {
@@ -90,12 +118,11 @@ export async function reconcileCapacity(env, { api, now = Date.now, log = consol
   const ref = env.MACHINE_REF || env.GITHUB_REF_NAME;
   if (!ref || /[\r\n\0]/.test(ref)) throw new Error("MACHINE_REF is required");
   const interval = capacityInterval(env);
-  const scheduled = env.GITHUB_EVENT_NAME === "schedule" && env.CAPACITY_TRIGGER !== "provider";
   const provider = env.CAPACITY_TRIGGER === "provider" && env.GITHUB_EVENT_NAME === "workflow_dispatch" &&
     env.GITHUB_WORKFLOW === "Machine schedule" && Boolean(env.CAPACITY_SLOT) &&
     env.GITHUB_WORKFLOW_REF === `${repo}/.github/workflows/watchdog.yml@refs/heads/${ref}`;
-  const dry = env.CAPACITY_DRY_RUN === "1" || !(scheduled || provider);
-  if (!dry && !/^[1-9]\d*$/.test(env.GITHUB_RUN_ID || "")) throw new Error("scheduled GITHUB_RUN_ID is required");
+  const dry = env.CAPACITY_DRY_RUN === "1" || !provider;
+  if (!dry && !/^[1-9]\d*$/.test(env.GITHUB_RUN_ID || "")) throw new Error("provider workflow GITHUB_RUN_ID is required");
   if (!dry && env.GITHUB_RUN_ATTEMPT && env.GITHUB_RUN_ATTEMPT !== "1") {
     log("A capacity rerun cannot repeat a host request.");
     return { target, launched: 0, duplicate: true };
@@ -105,8 +132,18 @@ export async function reconcileCapacity(env, { api, now = Date.now, log = consol
     if (!/^[0-9]$/.test(phase) || !/^[1-9]\d{12}$/.test(env.CAPACITY_SLOT) ||
         slot !== refillSlot(slot, phase, interval) || slot > now() || now() - slot >= LAUNCH_SPACING_MS)
       throw new Error("provider refill slot is stale, in the future, or has the wrong phase");
+    verifyProviderRequest(repo, ref, env.CAPACITY_SLOT, env.CAPACITY_AUTH_KEY, env.CAPACITY_SIGNATURE);
   }
   api ||= githubClient(env.GH_TOKEN, env.GITHUB_API_URL);
+  if (!dry) {
+    // Serialized by the workflow's concurrency group. A copied signature or
+    // a second dispatch for the same slot must not repeat the original launch.
+    const roots = await api(`/repos/${repo}/actions/workflows/watchdog.yml/runs?event=workflow_dispatch&per_page=100`);
+    if (!Array.isArray(roots.workflow_runs)) throw new Error("invalid provider request listing");
+    if (roots.workflow_runs.some(run => run.display_title === `Machine schedule (refill ${env.CAPACITY_SLOT})` &&
+        run.head_branch === ref && Number(run.id) < Number(env.GITHUB_RUN_ID)))
+      return { target, launched: 0, duplicate: true };
+  }
   const endpoint = `/repos/${repo}/actions/workflows/machine.yml`;
   const active = (await Promise.all(ACTIVE_STATUSES.map(async (state) => {
     const runs = [];

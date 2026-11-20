@@ -7,90 +7,53 @@ provider adapters. The same controller and agent work with other Linux providers
 
 ## GitHub Actions
 
-Each participating repository has `machine.yml` and `watchdog.yml` workflows.
-The latter appears as **Machine schedule** in the Actions UI.
-By default, scheduled watchdog runs launch machines. The watchdog reads its own
-repository's Actions inventory and target; it does not call the control plane.
-Manual watchdog runs are previews, and machine completion does not trigger a
-refill. An optional [replicated provider app](replicated-provider.md) can own the
-timer instead; it runs as an ordinary fleet app and needs no Mac service.
-
-`machine.yml` starts one Ubuntu Docker host and runs the generic agent directly
-in the job. Apps still run in Docker. Machine jobs verify the requesting
-`schedule_run` belongs to this repository's scheduled or provider-triggered
-watchdog on the same branch. They have read-only Actions permission and supply no `START_CMD` or
-GitHub token to the agent. Existing hosts finish their normal drain; their old
-direct handover dispatches cannot start new jobs through this workflow.
+[Fleet Provider](replicated-provider.md) is the only automatic machine trigger.
+Each participating repository contains its own `watchdog.yml` (**Machine schedule**)
+and `machine.yml`. There are no cron, push, release, or completion supply triggers.
+The provider primary claims a UTC refill slot and signs a request bound to that
+repository, default branch and slot. The serialized watchdog verifies the
+signature and freshness, rejects repeated slots, then rechecks Actions inventory.
+An unsigned manual request cannot launch a machine. Workflow reruns cannot
+repeat a launch; disabling Fleet Provider pauses replenishment.
 
 Configure each repository independently:
 
 | Repository setting | Purpose |
 | --- | --- |
-| Variable `CONTROL_URL` | The same stable HTTPS controller origin for the fleet. |
-| Secret `JOIN_TOKEN` | The same fleet join token; never a public variable. |
-| Variable `SERVER_TAG` | Distinct origin tag, such as `github`, `school` or `secondary`. |
+| Variable `CONTROL_URL` | Stable HTTPS controller origin. |
+| Secret `JOIN_TOKEN` | Fleet join token. |
+| Variable `SERVER_TAG` | Distinct pool origin tag. |
 | Variable `MACHINE_COUNT` | Desired capacity owned by this provider adapter. |
-| Variable `AGENT_REPO` | Optional source repository, such as `your-org/runner`; defaults to this repository. |
+| Variable `CAPACITY_TRIGGER` | Must be `provider`; other values disable supply. |
+| Variable `CAPACITY_PHASE_MIN` | Phase `0`–`9`, scaled to the refill interval. |
+| Variable `CAPACITY_INTERVAL_MIN` | Refill interval: `1`, `2`, `5` or `10` minutes. |
+| Secret `FLEET_PROVIDER_DISPATCH_KEY` | Private 64-character lowercase hex key, also stored as this provider's `dispatchKey`. |
 | Variable `REGION` | Optional explicit location label. |
 
-`POOL` and `POOL_SIZE` are compatibility aliases. The watchdog uses its own
-repository-scoped GitHub token; no cross-account credentials are needed.
-Machine jobs have a six-hour timeout and report a 355-minute lifetime. The
-control plane schedules app evacuation before the deadline using its ordinary
-departure gates. Agent and controller source contain no account-specific logic.
+`POOL` and `POOL_SIZE` remain compatibility aliases. Each watchdog uses its own
+repository-scoped GitHub token and image. See [independent pools](independent-pools.md).
+Build and migration workflows are explicit maintenance actions, with no push trigger.
 
-For multiple accounts, configure each provider repository with its own target
-and tag, while sharing only the fleet origin/join identity. A controller move
-between VPS, native Mac and Docker requires no provider URL change when that
-public origin remains stable.
+## Staggered supply
 
-## Interleaved schedules
+Each account requests at most one host per claimed interval. Distinct phases
+interleave requests: at two minutes, phases `2`, `5`, `8` open at seconds
+`24`, `60`, `96`. Pending jobs reserve capacity. Failed launches count toward
+spacing. A host running for at least 210 minutes permits one warm overlap above
+the target. Actual running and pending jobs are capped at target plus one for
+new launches, including during migration from overlapping legacy handovers.
+The provider never cancels healthy hosts to enforce its target.
 
-Put `watchdog.yml` on each repository's default branch and enable its Actions
-workflow. Give accounts different minute offsets, for example:
+The machine job only accepts a fresh, same-branch provider workflow dispatched
+by `github-actions[bot]`. It starts the generic agent directly on its Ubuntu host;
+apps run in Docker. The job has a six-hour timeout and reports a 355-minute
+lifetime. The control plane evacuates apps before departure. No GitHub token
+or dispatch key is passed to the agent or workloads.
 
-| Account | UTC cron | Minutes within each hour |
-| --- | --- | --- |
-| First | `2,12,22,32,42,52 * * * *` | 02, 12, 22, 32, 42, 52 |
-| Second | `5,15,25,35,45,55 * * * *` | 05, 15, 25, 35, 45, 55 |
-| Third | `8,18,28,38,48,58 * * * *` | 08, 18, 28, 38, 48, 58 |
-
-In schedule mode, each reconciliation starts at most one host, with at least ten minutes between
-launch requests even if scheduled runs arrive together. Failed launches count
-toward that spacing. Pending jobs reserve capacity. A host running for at least
-210 minutes permits one extra host above the target to warm before departure;
-the provider never cancels healthy jobs to enforce its target. Actual running
-and pending jobs are capped at target plus one for new launch decisions,
-including during migration from overlapping legacy handovers.
-
-The [replicated provider app](replicated-provider.md) supports faster supply via
-`CAPACITY_INTERVAL_MIN=2`. Its primary claims one request per account per UTC
-interval, with scaled account offsets, and each workflow rechecks inventory.
-This lets a depleted pool recover without waiting ten minutes for every host.
-
-This spreads replenishment over time instead of creating a whole cohort with
-the same deadline. An empty pool deliberately ramps up one host per interval.
-The generic control plane still staggers departures and moves app replicas to
-available hosts before retiring a machine. New scheduled hosts pick up source
-updates naturally; `roll.yml` is explicit operator maintenance only.
-
-[GitHub schedule events can be delayed or dropped](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
-Offsets and overlap provide headroom, not exact-time guarantees. A prolonged
-GitHub scheduling interruption can reduce capacity in schedule mode. Provider
-mode uses a Raft primary's timer instead. Account quotas and workflow
-concurrency limits still apply.
-
-Verify scheduling by checking for new runs with `event: schedule` in each
-repository. An enabled workflow, a valid cron expression, or a successful manual
-preview does not prove that GitHub is delivering schedule events. If scheduled
-runs stop arriving, check the default branch, workflow state and associated
-account. Commit a cron change using an active account with write access to
-refresh the schedule association, then verify actual scheduled runs again.
-See [GitHub's schedule troubleshooting](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflow-stopped-running).
-
-Use **Run workflow** on **Machine schedule** to preview the account's plan
-without launching machines. Run its regression checks with Node.js 24:
+Verify supply by checking Fleet Provider status and signed `workflow_dispatch`
+runs titled **Machine schedule (refill …)**. Account restrictions, API quotas
+and job queues still apply. Run regression checks with Node.js 24:
 
 ```sh
-node --test .github/scripts/capacity.test.mjs
+node --test .github/scripts/capacity.test.mjs providers/github/scheduler.test.mjs providers/github/quota.test.mjs
 ```

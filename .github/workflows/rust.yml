@@ -6,9 +6,6 @@ on:
         description: Optional existing binary-build run for packaging tests only; no image is published
         required: false
         type: string
-  push:
-    branches: [codex/rust-low-memory]
-    paths: ['rust/**', '!rust/README.md', '!rust/runtime-image', 'control/raft/**', 'control/src/app.html', '.github/workflows/rust.yml']
 permissions:
   contents: read
   actions: read

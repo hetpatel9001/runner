@@ -82,11 +82,11 @@ database prevents startup instead of creating an empty fleet.
 
 GitHub-hosted machines have a finite job lifetime. An agent reconnects while its
 host remains alive; provider automation must replace hosts whose jobs have ended.
-Each account's GitHub schedule maintains its repository's `MACHINE_COUNT`, with
-interleaved cron offsets and bounded launches. Supply decisions use Actions
-inventory and continue while the controller is unavailable. No Mac or VPS
-provider supervisor is installed. See [provider adapters](providers.md) for
-schedule configuration, warm overlap and timing limits.
+Fleet Provider maintains each repository's `MACHINE_COUNT` through signed
+workflow requests, staggered phases and bounded launches. Supply decisions use
+Actions inventory; there is no cron fallback. No Mac or VPS provider supervisor
+is installed. See [provider adapters](providers.md) for configuration, warm
+overlap and timing limits.
 
 ## Troubleshooting
 

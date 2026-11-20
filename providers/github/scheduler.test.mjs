@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { replenish, refillSlot } from './scheduler.mjs';
-import { reconcileCapacity } from '../../.github/scripts/capacity.mjs';
+import { reconcileCapacity, signProviderRequest, verifyProviderRequest } from '../../.github/scripts/capacity.mjs';
 import { verifyScheduledOrigin } from '../../.github/scripts/verify-schedule.mjs';
 import { providerConfig } from './config.mjs';
 
 const now = Date.parse('2026-11-10T12:02:30Z'), slot = Date.parse('2026-11-10T12:02:00Z');
-const provider = { repo: 'owner/runner', token: 'private-test-token' };
+const provider = { repo: 'owner/runner', token: 'private-test-token', dispatchKey: 'cd'.repeat(32) };
 function fixture() {
   const calls = [], claims = new Map(), state = { term: 1, phase: '2', interval: '10', target: '6', active: [], history: [], fail: false, fenced: false };
   const options = { now: () => now,
@@ -43,7 +43,10 @@ test('two contenders with stale inventory still request just one refill', async 
   const results = await Promise.all([replenish(provider, f.options), replenish(provider, f.options)]);
   assert.equal(results.filter(r => r.action === 'requested').length, 1);
   assert.equal(f.calls.filter(c => c.method === 'POST').length, 1);
-  assert.deepEqual(f.calls.find(c => c.method === 'POST').body, { ref: 'main', inputs: { refill_slot: String(slot) } });
+  const request = f.calls.find(c => c.method === 'POST').body;
+  assert.deepEqual(request, { ref: 'main', inputs: { refill_slot: String(slot),
+    provider_signature: signProviderRequest(provider.repo, 'main', String(slot), provider.dispatchKey) } });
+  verifyProviderRequest(provider.repo, request.ref, request.inputs.refill_slot, provider.dispatchKey, request.inputs.provider_signature);
 });
 test('lost response consumes the attempt; the next leader does not repeat it', async () => {
   const f = fixture(); f.state.fail = true;
@@ -108,6 +111,8 @@ const workflow = { GITHUB_REPOSITORY: 'owner/runner', MACHINE_REF: 'main', MACHI
   GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_RUN_ID: '1234', GITHUB_WORKFLOW: 'Machine schedule',
   GITHUB_WORKFLOW_REF: 'owner/runner/.github/workflows/watchdog.yml@refs/heads/main',
   CAPACITY_TRIGGER: 'provider', CAPACITY_PHASE_MIN: '2', CAPACITY_SLOT: String(slot) };
+workflow.CAPACITY_AUTH_KEY = provider.dispatchKey;
+workflow.CAPACITY_SIGNATURE = signProviderRequest(provider.repo, workflow.MACHINE_REF, workflow.CAPACITY_SLOT, provider.dispatchKey);
 test('provider mode allows a fresh phased request and keeps cron and empty manual runs read-only', async () => {
   const f = fixture(); assert.equal((await reconcileCapacity(workflow, f.options)).launched, 1);
   for (const override of [{ GITHUB_EVENT_NAME: 'schedule' }, { CAPACITY_SLOT: '' },
@@ -126,6 +131,7 @@ test('stale slots, wrong phases, future slots and workflow reruns cannot launch'
 });
 test('workflow validation agrees with scaled provider phases and tolerates bounded queue delay', async () => {
   const fast = { ...workflow, CAPACITY_INTERVAL_MIN: '2', CAPACITY_SLOT: String(slot + 24_000) };
+  fast.CAPACITY_SIGNATURE = signProviderRequest(provider.repo, fast.MACHINE_REF, fast.CAPACITY_SLOT, provider.dispatchKey);
   const f = fixture();
   assert.equal((await reconcileCapacity(fast, f.options)).launched, 1);
   const delayed = fixture(); delayed.options.now = () => now + 3 * 60_000;
@@ -138,11 +144,18 @@ test('workflow validation agrees with scaled provider phases and tolerates bound
   }
 });
 test('machine jobs recognize provider requests but reject previews and other branches', async () => {
-  const env = { GITHUB_REPOSITORY: 'owner/runner', GITHUB_REF_NAME: 'main', SCHEDULE_RUN: '1234' };
-  const parent = { event: 'workflow_dispatch', path: '.github/workflows/watchdog.yml', head_branch: 'main', display_title: `Machine schedule (refill ${slot})` };
-  assert.equal(await verifyScheduledOrigin(env, async () => parent), true);
+  const env = { GITHUB_REPOSITORY: 'owner/runner', GITHUB_REF_NAME: 'main', SCHEDULE_RUN: '1234',
+    GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_ACTOR: 'github-actions[bot]' };
+  const parent = { event: 'workflow_dispatch', path: '.github/workflows/watchdog.yml', head_branch: 'main', run_attempt: 1, display_title: `Machine schedule (refill ${slot})` };
+  assert.equal(await verifyScheduledOrigin(env, async () => parent, () => now), true);
   for (const change of [{ display_title: 'Machine schedule' }, { head_branch: 'other' }, { path: '.github/workflows/machine.yml' }])
-    await assert.rejects(verifyScheduledOrigin(env, async () => ({ ...parent, ...change })));
+    await assert.rejects(verifyScheduledOrigin(env, async () => ({ ...parent, ...change }), () => now));
+});
+test('a provider without a dispatch key cannot consume a claim or send a request', async () => {
+  const f = fixture();
+  await assert.rejects(replenish({ ...provider, dispatchKey: undefined }, f.options), /dispatch key/);
+  assert.equal(f.claims.size, 0);
+  assert.equal(f.calls.filter(c => c.method === 'POST').length, 0);
 });
 test('the provider uses generic consensus without D1 and rejects even replica counts', () => {
   const env = { REPLICAS: '7', FLEET_REPLICA: '4', CLUSTER_ID: 'provider-test-cluster', CLUSTER_TOKEN: 'private-test-token-at-least-32-characters',
@@ -151,4 +164,5 @@ test('the provider uses generic consensus without D1 and rejects even replica co
   const config = providerConfig(env);
   assert.equal(config.id, 4); assert.equal(config.quorum, 4); assert.equal(config.raftEnv.CP_RAFT_ALLOW_CLAIMS, '1');
   assert.throws(() => providerConfig({ ...env, REPLICAS: '4' }));
+  assert.throws(() => providerConfig({ ...env, GITHUB_PROVIDERS: JSON.stringify([{ ...provider, dispatchKey: '' }]) }), /dispatch key/);
 });

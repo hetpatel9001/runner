@@ -17,8 +17,9 @@ export function providerConfig(env) {
   const seen = new Set();
   for (const provider of providers) {
     if (!provider || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(provider.repo || '') ||
-        typeof provider.token !== 'string' || !provider.token || seen.has(provider.repo.toLowerCase()))
-      throw new Error('each provider requires a distinct repository and private token');
+        typeof provider.token !== 'string' || !provider.token || !/^[a-f0-9]{64}$/.test(provider.dispatchKey || '') ||
+        seen.has(provider.repo.toLowerCase()))
+      throw new Error('each provider requires a distinct repository, private token and dispatch key');
     seen.add(provider.repo.toLowerCase());
   }
   return { ...config, id: Number(id), raftEnv, providers,

@@ -30,3 +30,19 @@ Updates are explicit per repository: build, validate, then advance that
 repository's digest. Existing machines keep their running code and rotate
 normally. The replicated controller and Fleet Provider still coordinate the
 fleet, and hosts still need GitHub, GHCR, and the configured controller.
+
+Runtime builds run only through explicit maintenance dispatches. Builds can
+request `activate_pool`; other builds retain the existing pin. Activation uses that repository's job token
+and stops if the source branch changed during compilation. The published
+image is pulled and its native bootstrap is smoke tested before activation.
+
+Machine supply is triggered only by signed Fleet Provider requests. Source pushes,
+runtime releases, workflow completions, cron, and manual machine dispatches cannot
+start hosts. Configure each repository's `FLEET_PROVIDER_DISPATCH_KEY` secret and
+the corresponding private provider `dispatchKey`; see [provider adapters](providers.md).
+
+Fleet Provider observes each account's API allowance and `Retry-After`
+headers. It budgets a complete inventory before another check, waits for
+quota reset when necessary, and exposes `quota` and `nextCheckAt` in status.
+An account limited to 60 API requests per hour refills more slowly than an
+ordinary account; normal host rotation and quantity limits still apply.

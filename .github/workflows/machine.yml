@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       schedule_run:
-        description: Scheduled or provider-triggered capacity run that requested this host
+        description: Fleet Provider capacity run that requested this host
         required: true
 
 permissions:
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   agent:
-    if: ${{ vars.CONTROL_URL != '' }}
+    if: ${{ vars.CONTROL_URL != '' && github.actor == 'github-actions[bot]' && github.run_attempt == 1 }}
     name: machine
     runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to a new release now and then, and a machine shouldn't change under the fleet
     timeout-minutes: 360 # GitHub's limit; the agent leaves at 355 minutes at the latest (LIFETIME_MIN below)

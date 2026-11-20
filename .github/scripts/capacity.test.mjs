@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ACTIVE_STATUSES, capacityPlan, githubClient, reconcileCapacity, targetCount } from "./capacity.mjs";
+import { ACTIVE_STATUSES, capacityPlan, githubClient, reconcileCapacity, signProviderRequest, targetCount, verifyProviderRequest } from "./capacity.mjs";
 import { verifyScheduledOrigin } from "./verify-schedule.mjs";
 
 const now = Date.parse("2026-11-10T12:00:00Z");
 const run = (id, slot, status = "in_progress", age = 60) => ({ id, display_title: `machine ${slot}`, status,
   created_at: new Date(now - age * 60_000).toISOString() });
 const env = { GITHUB_REPOSITORY: "school/Runners", MACHINE_REF: "main", MACHINE_COUNT: "15",
-  SERVER_TAG: "school", GITHUB_EVENT_NAME: "schedule", GITHUB_RUN_ID: "1234" };
+  SERVER_TAG: "school", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_RUN_ID: "1234",
+  GITHUB_WORKFLOW: "Machine schedule", GITHUB_WORKFLOW_REF: "school/Runners/.github/workflows/watchdog.yml@refs/heads/main",
+  CAPACITY_TRIGGER: "provider", CAPACITY_PHASE_MIN: "0", CAPACITY_SLOT: String(now), CAPACITY_AUTH_KEY: "ab".repeat(32) };
+env.CAPACITY_SIGNATURE = signProviderRequest(env.GITHUB_REPOSITORY, env.MACHINE_REF, env.CAPACITY_SLOT, env.CAPACITY_AUTH_KEY);
 
 function fixture({ active = [], recent = [], fail } = {}) {
   const calls = [];
@@ -16,6 +19,7 @@ function fixture({ active = [], recent = [], fail } = {}) {
       calls.push({ path, ...options });
       if (fail) await fail(path, options);
       if (options.method === "POST") return null;
+      if (path.includes("/watchdog.yml/runs")) return { workflow_runs: [] };
       const url = new URL(path, "https://api.example.test"), state = url.searchParams.get("status");
       return { workflow_runs: state ? active.filter(r => r.status === state) : recent };
     },
@@ -109,7 +113,7 @@ test("disabled providers do not contact any service", async () => {
   assert.deepEqual(await reconcileCapacity({ MACHINE_COUNT: "0" }, f.options), { target: 0, launched: 0 });
 });
 
-test("scheduled dispatches carry their GitHub run ID and require no control-plane endpoint", async () => {
+test("authenticated provider dispatches carry their GitHub run ID and require no control-plane endpoint", async () => {
   const f = fixture({ active: Array.from({ length: 10 }, (_, i) => run(i + 1, i + 1)) });
   const result = await reconcileCapacity(env, f.options);
   assert.equal(result.launched, 1);
@@ -119,8 +123,8 @@ test("scheduled dispatches carry their GitHub run ID and require no control-plan
   }]);
 });
 
-test("manual workflows, completion events, local runs and explicit dry runs never dispatch", async () => {
-  for (const override of [{ GITHUB_EVENT_NAME: "workflow_dispatch" }, { GITHUB_EVENT_NAME: "workflow_run" },
+test("legacy schedules, pushes, completion events, local runs and explicit dry runs never dispatch", async () => {
+  for (const override of [{ GITHUB_EVENT_NAME: "schedule", CAPACITY_TRIGGER: "schedule" }, { GITHUB_EVENT_NAME: "push" }, { GITHUB_EVENT_NAME: "workflow_run" },
     { GITHUB_EVENT_NAME: undefined }, { CAPACITY_DRY_RUN: "1" }]) {
     const f = fixture();
     const result = await reconcileCapacity({ ...env, ...override }, f.options);
@@ -157,17 +161,46 @@ test("active inventory is paginated beyond the newest hundred", async () => {
   assert.equal(result.launched, 0);
 });
 
-test("machine jobs accept only their own branch's scheduled watchdog as origin", async () => {
-  const launchEnv = { SCHEDULE_RUN: "1234", GITHUB_REPOSITORY: "school/Runners", GITHUB_REF_NAME: "main" };
-  const origin = { event: "schedule", path: ".github/workflows/watchdog.yml", head_branch: "main" };
+test("machine jobs accept only a bot dispatch from their own branch's fresh provider workflow", async () => {
+  const launchEnv = { SCHEDULE_RUN: "1234", GITHUB_REPOSITORY: "school/Runners", GITHUB_REF_NAME: "main",
+    GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_ACTOR: "github-actions[bot]" };
+  const origin = { event: "workflow_dispatch", path: ".github/workflows/watchdog.yml", head_branch: "main",
+    display_title: `Machine schedule (refill ${now})`, run_attempt: 1 };
   assert.equal(await verifyScheduledOrigin(launchEnv, async path => {
     assert.equal(path, "/repos/school/Runners/actions/runs/1234"); return origin;
-  }), true);
-  for (const change of [{ event: "workflow_dispatch" }, { event: "workflow_run" },
+  }, () => now), true);
+  for (const change of [{ event: "schedule" }, { event: "workflow_run" }, { run_attempt: 2 },
+    { display_title: `Machine schedule (refill ${now - 600_000})` },
+    { display_title: `Machine schedule (refill ${now + 1})` },
     { path: ".github/workflows/machine.yml" }, { head_branch: "other" }]) {
-    await assert.rejects(verifyScheduledOrigin(launchEnv, async () => ({ ...origin, ...change })), /scheduled watchdog/);
+    await assert.rejects(verifyScheduledOrigin(launchEnv, async () => ({ ...origin, ...change }), () => now), /Fleet Provider/);
   }
-  await assert.rejects(verifyScheduledOrigin({ ...launchEnv, SCHEDULE_RUN: "../42" }), /scheduled watchdog run/);
+  for (const change of [{ GITHUB_ACTOR: "owner" }, { GITHUB_EVENT_NAME: "schedule" }, { GITHUB_RUN_ATTEMPT: "2" }]) {
+    await assert.rejects(verifyScheduledOrigin({ ...launchEnv, ...change }, async () => {
+      assert.fail("untrusted dispatch must fail before API access");
+    }, () => now), /only the Fleet Provider/);
+  }
+  await assert.rejects(verifyScheduledOrigin({ ...launchEnv, SCHEDULE_RUN: "../42" }), /Fleet Provider workflow run/);
+});
+
+test("missing or forged provider signatures cannot reach GitHub or create hosts", async () => {
+  for (const override of [{ CAPACITY_SIGNATURE: "" }, { CAPACITY_SIGNATURE: "00".repeat(32) },
+    { CAPACITY_AUTH_KEY: "" }, { MACHINE_REF: "other", GITHUB_WORKFLOW_REF: "school/Runners/.github/workflows/watchdog.yml@refs/heads/other" }]) {
+    const f = fixture();
+    await assert.rejects(reconcileCapacity({ ...env, ...override }, f.options), /Fleet Provider/);
+    assert.equal(f.calls.length, 0);
+  }
+  assert.throws(() => verifyProviderRequest("other/runner", "main", String(now), env.CAPACITY_AUTH_KEY, env.CAPACITY_SIGNATURE), /signature/);
+  assert.throws(() => verifyProviderRequest(env.GITHUB_REPOSITORY, "main", String(now - 1), env.CAPACITY_AUTH_KEY, env.CAPACITY_SIGNATURE), /signature/);
+});
+
+test("a second dispatch reusing a signed refill slot cannot launch another host", async () => {
+  const f = fixture(), api = f.options.api;
+  f.options.api = async (path, options) => path.includes("/watchdog.yml/runs")
+    ? { workflow_runs: [{ id: 1233, display_title: `Machine schedule (refill ${now})`, head_branch: "main" }] }
+    : api(path, options);
+  assert.equal((await reconcileCapacity(env, f.options)).duplicate, true);
+  assert.equal(f.calls.length, 0);
 });
 
 test("GitHub HTTP errors omit response bodies and credentials", async () => {

@@ -1,6 +1,6 @@
 # Replicated GitHub provider
 
-`providers/github/` is an optional, ordinary Docker application that replenishes
+`providers/github/` is the ordinary Docker application that replenishes
 GitHub-hosted machines. It owns provider credentials and capacity targets;
 neither the control plane nor the generic agent calls account APIs. Other
 compute providers can continue supplying the same fleet independently.
@@ -35,13 +35,15 @@ Supply these values in the app's private environment:
 | `MEMBERS` | JSON array of `{ "id": 1, "url": "https://provider-1.example.com" }`, one distinct origin per logical replica. |
 | `CLUSTER_ID` | Stable identifier of 16–100 letters, digits, underscores or dashes. |
 | `CLUSTER_TOKEN` | Private random peer credential of at least 32 characters. |
-| `GITHUB_PROVIDERS` | Private JSON array of `{ "repo": "owner/repository", "token": "..." }`. Tokens need repository variables read and Actions write access. |
+| `GITHUB_PROVIDERS` | Private JSON array of `{ "repo": "owner/repository", "token": "...", "dispatchKey": "64 lowercase hex characters" }`. Tokens need repository variables read and Actions write access. |
 | `NODE_ID` | Optional explicit ID for an independently hosted copy; fleet copies use `FLEET_REPLICA`. |
 | `NODE_ID_OFFSET` | Optional offset for fleet IDs when some logical slots run elsewhere. |
 | `PORT` | HTTP port, default `8924`. |
 
 Existing repository settings remain `CONTROL_URL`, `JOIN_TOKEN`, `SERVER_TAG`,
-`MACHINE_COUNT`, and optional `AGENT_REPO`. Add `CAPACITY_TRIGGER=provider` and
+`MACHINE_COUNT`. Add the secret `FLEET_PROVIDER_DISPATCH_KEY` matching that
+repository's private `dispatchKey` (generate 32 random bytes as lowercase hex).
+Set `CAPACITY_TRIGGER=provider` and
 `CAPACITY_PHASE_MIN` from `0` through `9`; distinct phases such as `2`, `5`, `8`
 interleave account requests. `CAPACITY_INTERVAL_MIN` accepts `1`, `2`, `5`, or
 `10` (default `10`). The legacy phase setting scales with the interval: at two
@@ -50,10 +52,12 @@ The whole interval remains eligible, so launch or polling delays do not close a
 narrow window. A half-interval minimum between actual machine requests prevents
 late adjacent slots from bunching, without shifting every later phase. Workflows
 recheck inventory and reject requests more than ten minutes old, allowing bounded
-queue delay. In provider mode, cron does not launch hosts.
-Removing provider mode restores normal repository-owned scheduled supply.
-Manual capacity workflow runs with an empty slot remain previews. Credentials
-are never returned by the provider's status API or passed to machine jobs.
+queue delay. Fleet Provider is the only supply trigger; there is no cron fallback.
+Removing provider mode disables replenishment. Requests require an HMAC-SHA256
+signature bound to repository, branch and slot. Unsigned manual requests, copied
+slot requests, legacy schedule events, and reruns cannot launch hosts. Machine
+jobs also verify their bot caller and fresh parent workflow. Credentials are never
+returned by the provider's status API or passed to agents or workloads.
 
 ## Consensus and duplicate attempts
 
