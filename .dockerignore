@@ -1,0 +1,17 @@
+.git
+**/node_modules
+**/__pycache__
+**/*.pyc
+.env
+.env.*
+!.env.example
+**/*.db
+**/*.db-*
+**/identity.json
+**/backups
+**/.dev.vars
+**/.wrangler
+control/build
+data
+rust/target
+.DS_Store

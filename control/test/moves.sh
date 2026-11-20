@@ -1,0 +1,33 @@
+#!/bin/bash
+HERE=$(cd "$(dirname "$0")" && pwd)
+cd "$HERE/.."
+. "$HERE/stop.sh"
+(node "$HERE/cloudflare-mock.mjs" > /tmp/runner-test-mock.log 2>&1 &)
+. "$HERE/start.sh" ADMIN_PASSWORD=adm JOIN_TOKEN=node 'POOLS={"main":3}'
+for i in $(seq 1 30); do curl -sf localhost:8911/api/status >/dev/null && break; sleep 1; done
+B=localhost:8911; START=$(date +%s%3N)
+A='x-admin-password: adm'
+put() { curl -s -X PUT $B/api/projects/$1 -H "$A" -H content-type:application/json -d "$2" >/dev/null; }
+join() { curl -s -X POST $B/api/join -H 'authorization: Bearer node' -H content-type:application/json -d "{\"agent\":\"$1\",\"pool\":\"main\",\"want\":$2}" >/dev/null; }
+# sync machine run cpu mem [statusjson]
+sync() { curl -s -X POST $B/api/sync -H 'authorization: Bearer node' -H content-type:application/json -d "{\"machine\":$1,\"run\":\"$2\",\"agent\":\"agent-$2\",\"pool\":\"main\",\"started\":$START,\"ready\":true,\"status\":${5:-{\}},\"metrics\":{\"live\":{\"t\":$(date +%s%3N),\"h\":{\"cpu\":$3,\"memUsed\":$4,\"memTotal\":100},\"a\":{}}}}" | jq -c '{m:'$1', desired:(.desired|keys)}'; }
+show() { curl -s $B/api/status | jq -c '.projects[] | {name, staying, placed:[.placed[] | "r\(.replica)@\(.machine)\(if .leaving then " (leaving→\(.leaving.to))" else "" end)"]}'; }
+put web '{"port":8080,"dockerfile":"FROM x","replicas":1}'
+join a 1; join b 2; join c 3
+sync 1 r1 80 80 >/dev/null; sync 2 r2 5 20 >/dev/null; sync 3 r3 30 40 >/dev/null
+echo "== placed:"; show
+echo "== move web off machine 2 (auto destination):"; curl -s -X POST "$B/api/projects/web/move?from=2" -H "$A" | jq -c '[.placed[] | {machine, reason, leaving}]'
+echo "-- both machines should want it now:"; sync 2 r2 5 20; sync 3 r3 30 40
+echo "-- new copy (m3) reports healthy -> old copy dropped once DNS points at it (a sync 2 s later):"; sync 3 r3 30 40 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; sleep 3; sync 3 r3 30 40 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; sync 2 r2 5 20; show
+echo "== move again to a named machine (1):"; curl -s -X POST "$B/api/projects/web/move?from=3&to=1" -H "$A" | jq -c '[.placed[] | {machine, leaving}]'
+echo "-- move while moving is refused:"; curl -s -X POST "$B/api/projects/web/move?from=3" -H "$A" | jq -c .
+echo "== evict machine 1 (web's new copy is there, not yet healthy): web is already changing as much as it may, so it waits:"; curl -s -X POST "$B/api/machines/1/evict" -H "$A" | jq -c .
+echo "-- forced, it moves anyway: the move from 3 is redirected (no chain of two moves, never two copies left):"; curl -s -X POST "$B/api/machines/1/evict?force=1" -H "$A" | jq -c .
+show
+D=$(curl -s $B/api/status | jq -r '.projects[] | select(.name == "web") | .placed[] | select(.leaving | not) | .machine')
+echo "-- the new copy (m$D) reports healthy: one copy is left, on $D:"; sync $D r$D 5 20 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; sleep 3; sync $D r$D 5 20 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; show
+echo "== sending a move's new copy back where it came from calls the move off:"; O=$(( D == 1 ? 2 : 1 ))
+curl -s -X POST "$B/api/projects/web/move?from=$D&to=$O" -H "$A" > /dev/null; show
+curl -s -X POST "$B/api/projects/web/move?from=$O&to=$D" -H "$A" | jq -c '[.placed[] | {machine, leaving}]'
+echo "== portal can't move:"; curl -s -o /dev/null -w "%{http_code}\n" -X POST "$B/admin/api/machines/1/evict" -H 'origin: http://localhost:8911'
+. "$HERE/stop.sh"

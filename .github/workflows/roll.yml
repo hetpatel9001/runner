@@ -1,0 +1,19 @@
+name: roll
+
+# Explicit operator maintenance only. Scheduled hosts pick up agent changes
+# naturally; a source push must not expire a whole provider cohort.
+on:
+  workflow_dispatch:
+
+jobs:
+  roll:
+    if: ${{ vars.CONTROL_URL != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Ask the control plane for a rolling restart
+        env:
+          JOIN_TOKEN: ${{ secrets.JOIN_TOKEN }}
+          CONTROL_URL: ${{ vars.CONTROL_URL }}
+        run: |
+          curl -sSf -X POST -H "Authorization: Bearer $JOIN_TOKEN" "$CONTROL_URL/api/roll"

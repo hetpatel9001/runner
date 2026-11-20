@@ -1,0 +1,39 @@
+name: Rust agent migration
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/rust-live-cutover]
+    paths: ['control/migration/**', 'control/test/rust-agent-hot-migration.py', '.github/workflows/rust-migration.yml']
+permissions:
+  contents: read
+concurrency:
+  group: rust-migration-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify real Docker migration and rollback
+        run: python3 control/test/rust-agent-hot-migration.py
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Publish tested one-shot helper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --name migration-release --driver docker-container --use
+          docker buildx build --platform linux/amd64,linux/arm64 -f control/migration/agent.Dockerfile --target release --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "ghcr.io/${GITHUB_REPOSITORY,,}/control:agent-migration-$GITHUB_SHA" --push .

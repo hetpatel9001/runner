@@ -1,0 +1,117 @@
+#!/bin/bash
+# Apps are open: anyone can deploy, change or remove one, through the UI's API and /api alike, unless it was locked
+# with a password; then changing it needs that password or the admin password. Fleet changes need the admin password.
+# An address that gets a password wrong 5 times is refused for a while (counted per app, and for the fleet). Each line
+# says ok, or WRONG with what came back.
+HERE=$(cd "$(dirname "$0")" && pwd)
+cd "$HERE/.."
+. "$HERE/stop.sh"
+(node "$HERE/cloudflare-mock.mjs" > /tmp/runner-test-mock.log 2>&1 &)
+. "$HERE/start.sh" ADMIN_PASSWORD=hunter2 JOIN_TOKEN=node 'POOLS={"main":2}'
+for i in $(seq 1 30); do curl -sf localhost:8911/api/status >/dev/null && break; sleep 1; done
+U=localhost:8911/admin/api
+A=localhost:8911/api
+J=(-H content-type:application/json)
+want() {
+  local w=$1 c; shift
+  c=$(curl -s -o /tmp/runner-test-body -w '%{http_code}' "$@")
+  if [ "$c" = "$w" ]; then echo "  ok $c $(head -c 100 /tmp/runner-test-body)"; else echo "  WRONG: got $c, wanted $w: $(head -c 200 /tmp/runner-test-body)"; fi
+}
+has() { curl -s $U/status | jq -r ".projects[] | select(.name == \"$1\") | \"  $1 hasPassword: \(.hasPassword)\""; }
+
+echo "== anyone: status and metrics"
+want 200 $U/status
+want 200 "$A/metrics?range=1h"
+echo "== an open app: deployed, changed, removed by anyone, with no credentials"
+want 200 -X PUT $U/projects/open "${J[@]}" -d '{"port":8070,"dockerfile":"FROM x"}'
+has open
+want 200 -X PUT $U/projects/open "${J[@]}" -d '{"port":8070,"dockerfile":"FROM y"}'
+want 200 -X POST $U/projects/open/disable
+want 200 -X POST $A/projects/open/enable
+want 200 -X PUT $A/projects/open "${J[@]}" -d '{"port":8070,"dockerfile":"FROM z","replicas":2}'
+want 401 -X POST $U/projects/open/disable -H 'x-admin-password: nope'
+want 200 -X DELETE $A/projects/open
+echo "== without the admin password an app gets an ordinary container only (the sandbox)"
+want 400 -X PUT $A/projects/privileged "${J[@]}" -d '{"port":8071,"compose":"services:\n  p:\n    image: x\n    privileged: true\n"}'
+want 200 -X PUT $A/projects/privileged -H 'x-admin-password: hunter2' "${J[@]}" -d '{"port":8071,"compose":"services:\n  p:\n    image: x\n    privileged: true\n"}'
+want 200 -X DELETE $A/projects/privileged -H 'x-admin-password: hunter2'
+echo "== a password locks a new app; it's 6 or more characters"
+want 400 -X PUT $U/projects/web "${J[@]}" -d '{"port":8080,"dockerfile":"FROM x","password":"short"}'
+want 200 -X PUT $U/projects/web "${J[@]}" -d '{"port":8080,"dockerfile":"FROM x","password":"web-secret"}'
+has web
+echo "== the password (or its hash) is never sent out"
+curl -s $U/projects/web $U/status | grep -c 'web-secret\|"salt"\|"hash"' | sed 's/^/  mentions: /'
+echo "== changing it without its password: refused"
+want 401 -X PUT $U/projects/web "${J[@]}" -d '{"port":8080,"dockerfile":"FROM y"}'
+want 401 -X POST $U/projects/web/disable
+want 401 -X POST "$U/projects/web/move?from=1"
+want 401 -X DELETE $U/projects/web
+want 401 -X POST $U/projects/web/unlock -H 'x-app-password: nope'
+echo "== a password in the body only counts for a new app"
+want 401 -X PUT $U/projects/web "${J[@]}" -d '{"port":8080,"dockerfile":"FROM y","password":"web-secret"}'
+echo "== with its password"
+want 200 -X POST $U/projects/web/unlock -H 'x-app-password: web-secret'
+want 200 -X PUT $U/projects/web -H 'x-app-password: web-secret' "${J[@]}" -d '{"port":8080,"dockerfile":"FROM y"}'
+want 200 -X POST $U/projects/web/disable -H 'x-app-password: web-secret'
+want 200 -X POST $U/projects/web/enable -H 'x-app-password: web-secret'
+echo "== another app's password doesn't open it"
+want 200 -X PUT $U/projects/api "${J[@]}" -d '{"port":9090,"dockerfile":"FROM x","password":"api-secret"}'
+want 401 -X POST $U/projects/web/disable -H 'x-app-password: api-secret'
+echo "== the admin password opens every app; a wrong one says so"
+want 200 -X POST $U/projects/api/disable -H 'x-admin-password: hunter2'
+want 200 -X POST $U/projects/api/unlock -H 'x-admin-password: hunter2'
+want 401 -X POST $U/projects/api/enable -H 'x-admin-password: nope'
+echo "== changing the password needs the old one (or the fleet's); then only the new one works"
+want 401 -X PUT $U/projects/web/password "${J[@]}" -d '{"password":"web-secret-2"}'
+want 400 -X PUT $U/projects/web/password -H 'x-app-password: web-secret' "${J[@]}" -d '{"password":"x"}'
+want 200 -X PUT $U/projects/web/password -H 'x-app-password: web-secret' "${J[@]}" -d '{"password":"web-secret-2"}'
+want 401 -X POST $U/projects/web/unlock -H 'x-app-password: web-secret'
+want 200 -X POST $U/projects/web/unlock -H 'x-app-password: web-secret-2'
+echo "== an open app can be locked later (by anyone, or the admin password); from then on it's locked"
+want 200 -X PUT $A/projects/legacy -H 'x-admin-password: hunter2' "${J[@]}" -d '{"port":7070,"dockerfile":"FROM x"}'
+has legacy
+want 200 -X POST $U/projects/legacy/disable
+want 200 -X PUT $U/projects/legacy/password -H 'x-admin-password: hunter2' "${J[@]}" -d '{"password":"legacy-pass"}'
+has legacy
+want 401 -X POST $U/projects/legacy/enable
+want 200 -X POST $U/projects/legacy/enable -H 'x-app-password: legacy-pass'
+echo "== scripts: the admin password on /api changes any app; a locked app refuses /api without it, and the join token only does machine things"
+want 200 -X POST $A/projects/web/disable -H 'x-admin-password: hunter2'
+want 401 -X POST $A/projects/web/enable
+want 401 -X POST $A/projects/web/enable -H 'authorization: Bearer node'
+want 401 $A/join-token -H 'authorization: Bearer node'
+want 200 $A/join-token -H 'x-admin-password: hunter2'
+echo "== 5 wrong passwords for web: web refuses this address for a while, even the right one; api and the fleet don't"
+for i in 1 2 3 4 5; do want 401 -X POST $U/projects/web/unlock -H 'x-app-password: wrong' >/dev/null; done
+want 429 -X POST $U/projects/web/unlock -H 'x-app-password: web-secret-2'
+want 200 -X POST $U/projects/api/unlock -H 'x-app-password: api-secret'
+want 200 -X POST $U/unlock -H 'x-admin-password: hunter2'
+want 200 -X POST $U/projects/web/enable -H 'x-admin-password: hunter2'
+echo "== deleting an app deletes its password: the name can be deployed again with a new one"
+want 200 -X DELETE $U/projects/api -H 'x-app-password: api-secret'
+want 200 -X PUT $U/projects/api "${J[@]}" -d '{"port":9090,"dockerfile":"FROM x","password":"new-owner"}'
+want 401 -X POST $U/projects/api/unlock -H 'x-app-password: api-secret'
+want 200 -X POST $U/projects/api/unlock -H 'x-app-password: new-owner'
+echo "== fleet changes without the password: refused"
+want 401 -X PUT $U/settings "${J[@]}" -d '{"rebalance":false}'
+want 401 -X POST $U/roll
+want 401 -X DELETE $U/roll
+want 401 -X POST $U/machines/1/evict
+want 401 -X DELETE $U/slots/9
+want 401 $U/join-token
+echo "== unlock: wrong, then right"
+want 401 -X POST $U/unlock -H 'x-admin-password: nope'
+want 200 -X POST $U/unlock -H 'x-admin-password: hunter2'
+echo "== fleet changes with the password"
+want 200 -X PUT $U/settings -H 'x-admin-password: hunter2' "${J[@]}" -d '{"rebalance":false}'
+want 200 -X POST $U/roll -H 'x-admin-password: hunter2'
+want 200 -X DELETE $U/roll -H 'x-admin-password: hunter2'
+want 200 $U/join-token -H 'x-admin-password: hunter2'
+echo "== fleet changes from a script: the admin password on /api"
+want 200 -X PUT $A/settings -H 'x-admin-password: hunter2' "${J[@]}" -d '{"rebalance":true}'
+echo "== 5 wrong admin passwords, then even the right one is refused for a while"
+for i in 1 2 3 4 5; do want 401 -X POST $U/unlock -H 'x-admin-password: wrong' >/dev/null; done
+want 429 -X POST $U/unlock -H 'x-admin-password: hunter2'
+echo "== from another site: refused"
+want 403 -X PUT $U/projects/web -H 'origin: https://evil.example' "${J[@]}" -d '{"port":8080,"dockerfile":"FROM x"}'
+. "$HERE/stop.sh"

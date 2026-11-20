@@ -1,0 +1,15 @@
+.wrangler/
+node_modules/
+__pycache__/
+*.pyc
+.dev.vars
+control/build/
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+identity.json
+data/
+rust/target/
+rust/dist/

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# runnerctl: manage projects on the runner control plane (same API as the admin portal).
+#   runnerctl apply <folder|compose.yml|Dockerfile> [name] [--port N] [--replicas N]
+#       add or update a project. A folder sends its compose file (if any) plus every other file in it,
+#       e.g. a Dockerfile and what it COPYs. A Dockerfile on its own becomes a one-service project.
+#       The name defaults to the folder or file name. Every machine updates at once.
+#   runnerctl get <name> [version]   print a project's compose file and other files
+#   runnerctl disable|enable <name>  stop or start a project on every machine (the spec is kept)
+#   runnerctl rm <name>              delete a project and its versions
+#   runnerctl password <name>        lock an app with an app password (asked for), or change it; changing the app then needs it
+#   runnerctl env <name> [KEY=value|KEY=@file ...] [--unset KEY ...]
+#                                    the app's env: set or remove variables (no arguments: list the names). Every copy
+#                                    gets them in its .env (compose reads ${VAR} from it; env_file: .env passes them
+#                                    on) with FLEET_APP, FLEET_REPLICA, FLEET_MACHINE, FLEET_HOST... Values are never
+#                                    shown again, so secrets go here, not in the compose file. A change is a new version.
+#   runnerctl status                 projects and machines
+#   runnerctl roll [machine|stop]    replace machines one at a time (e.g. after an agent change); stop calls it off
+#   runnerctl groups                connected servers grouped by their origin tag
+#   runnerctl join-token             the token another host joins with (see /install.sh)
+#   runnerctl move <name> <from> [to] [replica]  move one copy of a project off a machine (new copy first, old one removed once
+#                                    healthy); with two copies there, say which replica
+#   runnerctl evict <machine> [--force]  move every placed project off a machine (apps already changing as much as
+#                                    they may wait for later, unless forced)
+#   runnerctl events [n] [kinds]     the last n events (default 30), newest last: what moved, left or went dark and why;
+#                                    kinds narrows them, e.g. move-start,depart,alert
+#   runnerctl rebalance on|off       automatic moves (hot servers, failing copies, doubled-up copies)
+#   runnerctl retire <machine>       retire an empty slot: delete its tunnel and <app>-n names
+# The admin password (new fleets require it for deployment and fleet changes) comes from
+# $ADMIN_PASSWORD or ~/.config/runnerctl/admin-password.
+# Set RUNNER_URL to your controller's public URL, or save it in ~/.config/runnerctl/url.
+set -euo pipefail
+URL=${RUNNER_URL:-$(cat ~/.config/runnerctl/url 2>/dev/null || true)}
+[[ "$URL" =~ ^https?://[^/]+/?$ ]] || { echo "Set RUNNER_URL to your controller, for example https://runners.example.com" >&2; exit 1; }
+URL=${URL%/}
+ADMIN_PASSWORD=${ADMIN_PASSWORD:-$(cat ~/.config/runnerctl/admin-password 2>/dev/null || cat ~/.config/runnerctl/fleet-password 2>/dev/null || true)}
+api() {
+  local response result
+  if response=$(curl -sS --fail-with-body ${ADMIN_PASSWORD:+-H "x-admin-password: $ADMIN_PASSWORD"} -H 'Content-Type: application/json' "$URL/api$1" "${@:2}"); then
+    printf '%s\n' "$response"
+  else
+    result=$?
+    # Keep the server's explanation even when the command's jq formatter would
+    # otherwise discard it (for example, move prints only the placed copies).
+    [ -z "$response" ] || printf '%s\n' "$response" >&2
+    return "$result"
+  fi
+}
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print } NR > 1 && !/^#/ { exit }' "$0"; exit 1; }
+
+cmd=${1:-}
+shift || true
+case "$cmd" in
+  apply)
+    [ $# -ge 1 ] || usage
+    src=$1; shift
+    name="" port="" replicas=""
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --now) ;; # every deploy goes to every machine at once now; kept so old commands still work
+        --port) port=${2:?--port needs a number}; shift ;;
+        --replicas) replicas=${2:?--replicas needs a number}; shift ;;
+        *) name=$1 ;;
+      esac
+      shift
+    done
+    if [ -z "$name" ]; then
+      if [ -d "$src" ]; then name=$(basename "$(realpath "$src")")
+      elif [[ $(basename "$src") == *[Dd]ockerfile ]]; then name=$(basename "$(dirname "$(realpath "$src")")")
+      else name=$(basename "${src%.*}"); fi
+    fi
+    body=$(python3 - "$src" "$port" "$replicas" <<'PY'
+import json, os, sys
+src, port, replicas = sys.argv[1:4]
+COMPOSE = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+body = {}
+if os.path.isdir(src):
+    files = {}
+    for root, dirs, names in os.walk(src):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "node_modules")
+        for n in sorted(names):
+            if n.startswith("."):
+                continue
+            rel = os.path.relpath(os.path.join(root, n), src).replace(os.sep, "/")
+            try:
+                text = open(os.path.join(root, n), encoding="utf-8").read()
+            except UnicodeDecodeError:
+                sys.exit(f"{rel} isn't a text file; only text files can be sent")
+            if rel in COMPOSE:
+                body["compose"] = text
+            else:
+                files[rel] = text
+    body["files"] = files
+elif os.path.basename(src).lower().endswith("dockerfile"):
+    body["dockerfile"] = open(src, encoding="utf-8").read()
+else:
+    body["compose"] = open(src, encoding="utf-8").read()
+if port:
+    body["port"] = int(port)
+if replicas:
+    body["replicas"] = int(replicas) if replicas.isdigit() else replicas  # the control plane explains a bad value
+print(json.dumps(body))
+PY
+)
+    api "/projects/$name" -X PUT --data-binary "$body" | jq . ;;
+  get)
+    [ $# -ge 1 ] || usage
+    api "/projects/$1${2:+?version=$2}" | jq -r 'if .error then .error else
+      "# \(.name) v\(.shown) (latest v\(.version)), port \(.port // "none")\n\(.compose)"
+      + ([.files | to_entries[] | "\n# --- \(.key)\n\(.value)"] | join("")) end' ;;
+  disable | enable) [ $# -eq 1 ] || usage; api "/projects/$1/$cmd" -X POST | jq . ;;
+  rm) [ $# -eq 1 ] || usage; api "/projects/$1" -X DELETE | jq . ;;
+  password)
+    [ $# -eq 1 ] || usage
+    read -rsp "New password for $1: " p; echo; read -rsp "Again: " p2; echo
+    [ "$p" = "$p2" ] || { echo "They don't match." >&2; exit 1; }
+    jq -n --arg p "$p" '{password: $p}' | api "/projects/$1/password" -X PUT --data-binary @- | jq . ;;
+  env)
+    [ $# -ge 1 ] || usage
+    name=$1; shift
+    if [ $# -eq 0 ]; then api "/projects/$name/env" | jq -r 'if .error then .error elif (.keys | length) == 0 then "(no variables)" else .keys[] end'; exit; fi
+    body='{}'
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --unset) body=$(jq -c --arg k "${2:?--unset needs a variable name}" '. + {($k): null}' <<<"$body"); shift ;;
+        *=@*) body=$(jq -c --arg k "${1%%=*}" --rawfile v "${1#*=@}" '. + {($k): ($v | rtrimstr("\n"))}' <<<"$body") ;;
+        *=*) body=$(jq -c --arg k "${1%%=*}" --arg v "${1#*=}" '. + {($k): $v}' <<<"$body") ;;
+        *) usage ;;
+      esac
+      shift
+    done
+    api "/projects/$name/env" -X PUT -d "$body" | jq -r 'if .error then .error else "\(.name) v\(.version): \(.keys | join(", "))" end' ;;
+  status | ls)
+    api /status | jq -r '
+      "Projects:",
+      (.projects[] | "  \(.name)  v\(.version)  \(.state)"
+        + (if .state == "rolling out" then " (\(.rollout)/\(.machines))" else "" end)
+        + (if (.placed | length) > 0 then "  replicas: " + ([.placed[] | select(.leaving | not) | "\(.replica)→#\(.machine)\(if .moved then "*" else "" end)"] | join(" ")) else "" end)
+        + (if .blocked then "\n    waiting: \(.blocked)" else "" end)
+        + (if (.files | length) > 0 then "  [builds: \(.files | join(", "))]" else "" end)
+        + (if .hasPassword == false then "  (no app password)" else "" end)
+        + (if .halted then "\n    \(.halted)" else "" end)),
+      "Machines: \([.runs[] | select(.live and (.retiring | not)) | .machine] | unique | length) of \(.expected) up",
+      (.runs[] | select(.live) | "  #\(.machine)  \(.label // "")  "
+        + (if .retiring then "leaving" elif .handover then "starting its replacement"
+           elif .ready then "online" else "starting" end)
+        + "  " + ([.projects | to_entries[] | "\(.key) v\(.value.v) \(.value.s)"] | join(", ")))' ;;
+  roll) if [ "${1:-}" = stop ]; then api /roll -X DELETE | jq .; else api "/roll${1:+?machine=$1}" -X POST | jq .; fi ;;
+  groups) [ $# -eq 0 ] || usage; api /status | jq '.groups' ;;
+  join-token) api /join-token | jq -r .token ;;
+  move) [ $# -ge 2 ] || usage; api "/projects/$1/move?from=$2${3:+&to=$3}${4:+&replica=$4}" -X POST | jq -c '.placed' ;;
+  evict) [ $# -ge 1 ] || usage; api "/machines/$1/evict$([ "${2:-}" = --force ] && echo '?force=1')" -X POST | jq . ;;
+  events) api "/events?limit=${1:-30}${2:+&kinds=$2}" | jq -r '.events | reverse | .[] | "\(.t / 1000 | strflocaltime("%m-%d %H:%M"))  \(.text)"' ;;
+  rebalance) case ${1:-} in on) v=true ;; off) v=false ;; *) usage ;; esac; api /settings -X PUT -d "{\"rebalance\": $v}" | jq . ;;
+  retire) [ $# -eq 1 ] || usage; api "/slots/$1" -X DELETE | jq . ;;
+  *) usage ;;
+esac

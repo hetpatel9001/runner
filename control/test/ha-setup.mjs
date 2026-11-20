@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict';
+import { replicaTunnel, route } from '../src/ha/tunnel.mjs';
+import { bootstrapManifest } from '../cluster-init.mjs';
+import { RuntimeTail } from '../src/ha/tail.mjs';
+import { replicaCount } from '../src/ha/config.mjs';
+const env = { CP_CLUSTER_ID: 'test-cluster-generation' };
+const members = [1,2,3,4,5,6,7].map(id => ({id}));
+const fresh = members.slice(3).map(({id}) => ({id,node:id*100,boot:'boot-'+id,phase:'uninitialized',generation:''}));
+const bootstrapConfig = {members,quorum:4};
+assert.equal(bootstrapManifest(bootstrapConfig,fresh,100).members.length,7);
+assert.throws(()=>bootstrapManifest(bootstrapConfig,fresh.slice(1),100), /quorum/);
+assert.throws(()=>bootstrapManifest(bootstrapConfig,[{...fresh[0],generation:'old'},...fresh.slice(1)],100), /memory still exists/);
+for(const n of [1,3,5,7])assert.equal(replicaCount(n),n);
+for(const n of [0,2,4,6])assert.throws(()=>replicaCount(n));
+const tail=new RuntimeTail();
+for(let i=100;i>0;i--)tail.transition({id:'term-'+i,at:i,term:i});
+assert.equal(tail.transitions.size,30);assert.deepEqual(tail.history().map(x=>x.term),Array.from({length:30},(_,i)=>100-i));
+console.log('ok bootstrap requires surviving-memory exclusion and quorum; transition retention is the latest 30');
+  const calls = [];
+  const api = async (_env, path, init = {}) => {
+    calls.push({ path, method: init.method || 'GET' });
+    if (path.includes('/cfd_tunnel?')) return [{ id: 'persistent-tunnel', name: 'control-cp-2', config_src: 'local' }];
+    if (path.endsWith('/token')) return 'test-tunnel-token';
+    if (path.includes('/dns_records')) return [];
+    throw new Error('unexpected API request');
+  };
+  const tunnelEnv = { ACCOUNT_ID: 'test', ZONE: 'test', CONTROLLER_TUNNEL_NAME: 'control', CONTROL_HOST: 'runners.example.com', CP_PEER_TUNNEL: '0' };
+  const config = { id: 2, cluster: env.CP_CLUSTER_ID, self: { url: 'https://app-2.example.com' } };
+  const tunnel = await replicaTunnel(tunnelEnv, config, api);
+  assert.equal(tunnel.id, 'persistent-tunnel');
+  assert.equal(calls.some(call => call.path.includes('dns_records')), false);
+  console.log('ok fleet peers keep ordinary app DNS and reuse their publication tunnel');
+  calls.length = 0;
+  await replicaTunnel({ ...tunnelEnv, CP_PEER_TUNNEL: '1' }, config, api);
+  assert.equal(calls.filter(call => call.method === 'POST' && call.path.includes('dns_records')).length, 1);
+  assert.equal(calls.some(call => call.method === 'POST' && call.path.includes('cfd_tunnel')), false);
+  console.log('ok externally hosted peers reuse a persistent named tunnel for their domain');
+  calls.length = 0;
+  await assert.rejects(route(tunnelEnv, tunnelEnv.CONTROL_HOST, tunnel.id, 'runner control ' + tunnelEnv.CONTROL_HOST, api,
+    async () => { throw new Error('leadership lost'); }), /leadership lost/);
+  assert.equal(calls.some(call => call.method !== 'GET'), false);
+  console.log('ok stale leadership cannot publish a primary DNS change');
+  const migrated = [];
+  const legacyAPI = async (_env, path, init = {}) => {
+    if (path.includes('/cfd_tunnel?')) return [{ id: 'old-control', name: 'control' }];
+    if (init.method === 'PATCH') { migrated.push(JSON.parse(init.body)); return {}; }
+    return [{ id: 'dns', type: 'CNAME', content: 'old-control.cfargotunnel.com', comment: 'legacy control install' }];
+  };
+  await route(tunnelEnv, tunnelEnv.CONTROL_HOST, tunnel.id, 'runner control ' + tunnelEnv.CONTROL_HOST, legacyAPI);
+  assert.equal(migrated[0].content, 'persistent-tunnel.cfargotunnel.com');
+  await assert.rejects(route(tunnelEnv, 'someone.example.com', tunnel.id, 'other', legacyAPI), /owned by another/);
+  console.log('ok first takeover can adopt only the configured legacy standalone tunnel');

@@ -1,0 +1,243 @@
+// Run the shipped inline application, with controlled asynchronous responses.
+// No service or production changes are made by these regressions.
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+import { setImmediate as tick } from 'node:timers/promises';
+
+const html = readFileSync(new URL('../src/app.html', import.meta.url), 'utf8');
+const script = html.split('<script>')[1].split('</script>')[0];
+const startup = script.lastIndexOf('\nroute();\nloadStatus();');
+assert.ok(startup > 0);
+const now = 1_800_000_000_000;
+const project = { name:'web', version:2, enabled:true, replicas:1, staying:1, files:[], port:8080,
+  updated:now-10000, placed:[{machine:1,replica:1,key:'web'}], hasPassword:false };
+const base = { now, domain:'example.test', projects:[project], slots:[1], runs:[{id:'new-run',machine:1,
+  started:now-10000,seen:now,live:true,ready:true,retiring:false,projects:{web:{s:'healthy',v:2}}}],
+  pools:[{name:'pool',size:1,live:1}], rebalance:{hot:[],state:'on'}, departures:{list:[]},
+  dark:[], alerts:[], starting:[], settling:false };
+
+function harness(status = structuredClone(base)) {
+  const nodes = new Map();
+  const node = (id) => {
+    const e = { innerHTML:'',textContent:'',value:'',className:'hint',style:{},open:false,
+      contains:()=>false,setAttribute(){},addEventListener(){},focus(){},scrollIntoView(){},
+      querySelector:q=>nodes.get(q)??null,querySelectorAll:()=>[],
+      showModal(){this.open=true;},close(){this.open=false;queueMicrotask(()=>this.onclose?.());} };
+    nodes.set(id,e); return e;
+  };
+  for (const id of ['#main','#sheet','form','.err','[type=submit]','#ad-head','#ad-status','#ad-replicas',
+    '#ad-versions','#ad-logs','#ad-spec','#ad-code','#ad-version','#ed-form','#ed-up','#ed-updir',
+    '#ed-compose','#ed-dockerfile','#ed-files','#ed-port','#ed-replicas','#ed-name','#ed-name-hint']) node(id);
+  const context = vm.createContext({ console,URLSearchParams,Request,Response,AbortController,
+    setTimeout,clearTimeout,setInterval,clearInterval,queueMicrotask,innerWidth:1365,addEventListener(){},
+    localStorage:{getItem:()=>null,setItem(){}},location:{hash:'#/',search:''},
+    getSelection:()=>null,document:{querySelector:q=>nodes.get(q)??null,querySelectorAll:()=>[],addEventListener(){},activeElement:null},
+    hooks:{}, fixture:status });
+  const run = s => vm.runInContext(s,context);
+  run(script.slice(0,startup));
+  run('S.status=fixture; getSpec=(...args)=>hooks.spec(...args); api=(...args)=>hooks.api(...args);');
+  return {context,run,nodes,node,status};
+}
+function deferred() { let resolve,reject; const promise=new Promise((a,b)=>{resolve=a;reject=b;}); return {promise,resolve,reject}; }
+const spec = v => ({name:'web',version:v,compose:`version ${v}`,files:{},port:8080,
+  versions:[1,2,3].map(version=>({version,port:8080,replicas:1,created:now}))});
+let passed=0;
+async function check(name,fn) { await fn(); console.log('PASS:',name); passed++; }
+
+await check('slow status polling shares one in-flight request',async()=>{
+  const h=harness(), response=deferred();let calls=0;
+  h.run('renderChrome=()=>{}; view={status(){}};');
+  h.context.hooks.api=()=>{calls++;return response.promise;};
+  const first=h.run('loadStatus()'), second=h.run('loadStatus()');
+  assert.equal(first,second);assert.equal(calls,1);
+  response.resolve(structuredClone(base));await first;
+  assert.equal(h.run('S.statusErr'),null);
+  h.context.hooks.api=()=>{calls++;return Promise.resolve(structuredClone(base));};
+  await h.run('loadStatus()');assert.equal(calls,2);
+});
+await check('status timeouts preserve the last data and permit a fresh retry',async()=>{
+  const h=harness();let timeout,calls=0;
+  h.run('renderChrome=()=>{}; view={status(){}};');
+  h.context.setTimeout=(fn,ms)=>{assert.equal(ms,15000);timeout=fn;return 1;};
+  h.context.clearTimeout=()=>{};
+  h.context.hooks.api=(_method,_path,_body,{signal})=>{calls++;return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(new Error('aborted'))));};
+  const pending=h.run('loadStatus()');timeout();await pending;
+  assert.equal(h.run('S.statusErr'),'Fleet status refresh timed out');
+  assert.equal(h.run('S.status.projects[0].name'),'web');
+  h.context.hooks.api=()=>{calls++;return Promise.resolve(structuredClone(base));};
+  await h.run('loadStatus()');assert.equal(calls,2);assert.equal(h.run('S.statusErr'),null);
+});
+
+await check('malformed URL escapes do not crash navigation', () => {
+  const h = harness(); h.context.location.hash = '#/apps/broken%ZZ?version=2';
+  assert.equal(h.run('parseHash().parts[1]'), 'broken%ZZ');
+  assert.equal(h.run('parseHash().q.get("version")'), '2');
+});
+
+await check('the main app link is global and replica rows keep their numbered URLs',()=>{
+  const h=harness(); h.context.hooks.spec=(_name,v)=>Promise.resolve(spec(v));
+  h.run('view=vApp("web"); view.status();');
+  assert.match(h.nodes.get('#ad-head').innerHTML,/href="https:\/\/web\.example\.test\/"[^>]*aria-label="Global app address"/);
+  assert.doesNotMatch(h.nodes.get('#ad-head').innerHTML,/href="https:\/\/web-1\.example\.test\//);
+  assert.match(h.nodes.get('#ad-replicas').innerHTML,/href="https:\/\/web-1\.example\.test\/"/);
+});
+
+await check('recovered incidents remain in history without counting as current problems',()=>{
+  const h=harness();
+  h.status.alerts=[{cause:'fails-everywhere',app:'web',t:now-20000,text:'web version 2 failed'},
+    {cause:'grace',machine:1,t:now-20000,text:'old run stopped'},
+    {cause:'departure-waiting',machine:1,t:now-20000,text:'old run waiting'}];
+  assert.equal(h.run('problems().length'),0);
+  assert.equal(h.status.alerts.length,3);
+});
+await check('a current app failure stays visible and an older version alert does not recur',()=>{
+  const h=harness(); h.status.runs[0].projects.web.s='failed';
+  h.status.alerts=[{cause:'fails-everywhere',app:'web',t:now-1000,text:'web version 1 failed'}];
+  const current=h.run('problems().map(p=>p.text).join(" | ")');
+  assert.match(current,/web: failing/); assert.doesNotMatch(current,/version 1 failed/);
+  h.status.alerts[0].text='web version 2 failed';
+  assert.match(h.run('problems().map(p=>p.text).join(" | ")'),/version 2 failed/);
+});
+await check('routine departure queues remain in Activity without becoming current problems',()=>{
+  const h=harness(); h.status.alerts=[{cause:'departure-waiting',machine:1,t:now-1000,text:'waiting for budget'}];
+  h.status.departures.list=[{machine:1,due:true,wait:'budget',leaving:null}];
+  h.node('#summary'); h.node('#banner');
+  assert.equal(h.run('problems().length'),0);
+  h.run('renderChrome()');
+  assert.match(h.nodes.get('#summary').innerHTML,/1 up/);
+  assert.doesNotMatch(h.nodes.get('#summary').innerHTML,/problem|pending/);
+  assert.match(h.run('eventLines(S.status.alerts)'),/waiting for budget/);
+  assert.match(h.run('depText(S.status.departures.list[0])'),/budget/);
+  h.status.departures.list[0].leaving='handover'; assert.equal(h.run('problems().length'),0);
+  h.status.departures.list[0].leaving=null; h.status.runs[0].started=now;
+  assert.equal(h.run('problems().length'),0);
+});
+await check('routine rotations do not suppress failed apps, missing replicas or DNS errors',()=>{
+  const h=harness();
+  h.status.alerts=Array.from({length:8},(_,i)=>({cause:'departure-waiting',machine:i+1,t:now-1000,text:'waiting for budget'}));
+  h.status.runs[0].projects.web.s='failed';
+  h.status.dark=[{app:'web',replica:1,since:now-1000,why:'no healthy copy'}];
+  h.status.dnsError='DNS update failed';
+  const current=h.run('problems()');
+  assert.equal(current.length,3);
+  assert.ok(current.every(p=>p.kind==='failed'));
+  assert.match(current.map(p=>p.text).join(' | '),/web: failing.*no healthy copy/);
+  assert.match(current.map(p=>p.text).join(' | '),/DNS update failed/);
+  assert.equal(h.status.alerts.length,8);
+});
+await check('legacy server targets do not generate missing-capacity warnings',()=>{
+  const h=harness(); h.status.pools.push({name:'missing-pool',size:18,live:0});
+  assert.equal(h.run('problems().length'),0);
+});
+await check('a departed empty server is history rather than missing capacity',()=>{
+  const h=harness();h.status.runs[0].live=false;h.status.projects[0].enabled=false;
+  assert.equal(h.run('problems().some(p=>p.kind==="gone")'),false);
+  assert.equal(h.run('machineState(1,null).text'),'inactive');
+});
+await check('the join form requires a tag and offers standalone explicitly',()=>{
+  const h=harness(), form=h.run('joinBlock()');
+  assert.match(form,/id="cj-tag" required/);
+  assert.match(form,/value="standalone"/);
+});
+await check('join command values are quoted as literal shell arguments',()=>{
+  const h=harness();
+  h.context.label="host $(printf surprise) 'quoted'";
+  assert.equal(h.run('shellQuote(label)'),"'host $(printf surprise) '\\''quoted'\\'''" );
+});
+await check('a late app response cannot overwrite the next page',async()=>{
+  const h=harness(), d=deferred(); h.context.hooks.spec=()=>d.promise;
+  h.run('view=vApp("web"); view.status(); view.unmount(); view=null;');
+  h.nodes.get('#ad-spec').innerHTML='next page'; d.resolve(spec(2)); await tick();
+  assert.equal(h.nodes.get('#ad-spec').innerHTML,'next page');
+});
+await check('rapid version selections keep the most recently selected version',async()=>{
+  const h=harness(), old=deferred(); h.context.hooks.spec=(_name,v)=>v===1?old.promise:Promise.resolve(spec(v));
+  h.run('view=vApp("web"); view.status();'); await tick();
+  const click=v=>h.run('view').click({target:{closest:()=>({dataset:{act:'view',v:String(v)}})}});
+  const first=click(1); await click(3); old.resolve(spec(1)); await first; await tick();
+  assert.equal(h.nodes.get('#ad-code').textContent,'version 3');
+});
+await check('a late editor load cannot fill a different editor',async()=>{
+  const h=harness(), d=deferred(); h.context.hooks.api=()=>d.promise;
+  const editor=h.run('vEditor("web")'); const mounting=editor.mount(); editor.unmount();
+  h.nodes.get('#ed-compose').value='new unsaved draft'; d.resolve(spec(2)); await mounting;
+  assert.equal(h.nodes.get('#ed-compose').value,'new unsaved draft');
+});
+await check('navigation cancels a password sheet before another sheet opens',async()=>{
+  const h=harness(); const first=h.run('sheet({title:"First",html:""})');
+  const second=h.run('sheet({title:"Second",html:""})'); assert.equal(await first,null);
+  h.run('cancelSheet()'); assert.equal(await second,null);
+});
+function logHarness() {
+  const h=harness(), sockets=[];
+  h.node('#ad-logbar'); Object.assign(h.node('#ad-logtext'),{scrollTop:0,scrollHeight:100,clientHeight:100});
+  h.context.WebSocket=class {constructor(url){this.url=url;sockets.push(this);}close(){this.closed=true;}};
+  h.context.hooks.spec=(_name,v)=>Promise.resolve(spec(v));
+  h.run('withPassword=async(_options,fn)=>fn({admin:"test-only"});view=vApp("web");view.status();');
+  const click=act=>h.run('view').click({target:{closest:()=>({dataset:{act}})}});
+  return {...h,sockets,click};
+}
+await check('leaving during log authentication never opens a background stream',async()=>{
+  const h=logHarness(),d=deferred(); h.context.hooks.api=()=>d.promise;
+  const opening=h.click('logs-open'); h.run('view.unmount()');
+  d.resolve({session:'late-session'}); await opening; await tick();
+  assert.equal(h.sockets.length,0);
+});
+await check('closing logs cancels an in-flight resume instead of reopening the socket',async()=>{
+  const h=logHarness(); h.context.hooks.api=()=>Promise.resolve({session:'first-session'});
+  await h.click('logs-open'); assert.equal(h.sockets.length,1);
+  await h.click('logs-pause'); assert.equal(h.sockets[0].closed,true);
+  const d=deferred();h.context.hooks.api=()=>d.promise;
+  const resuming=h.click('logs-pause');await h.click('logs-close');
+  d.resolve({session:'cancelled-resume'});await resuming;await tick();
+  assert.equal(h.sockets.length,1);
+});
+function clusterHarness() {
+  const h=harness();
+  for(const id of ['#cp-history','#cp-refresh','#cp-meta','#cp-summary','#cp-replicas','#cp-transitions']) h.node(id);
+  const at=Date.now();
+  h.cluster={self:2,count:3,quorum:2,term:4,observedAt:at,replicas:[1,2,3].map(id=>({
+    id,url:`https://cp-${id}.example.test`,label:`Host ${id}`,reachable:true,lastSeen:at,
+    view:{primary:id===1,raft:{identityValid:true,role:id===1?'StateLeader':'StateFollower',leader:1,term:4},rlog:{entries:5,bytes:100},memoryBytes:1000}
+  })),transitions:[{at,term:4,leader:1}]};
+  h.context.fetch=async path=>{assert.equal(path,'/api/cluster');return Response.json(h.cluster);};
+  h.panel=h.run('controlPlanePanel()');return h;
+}
+await check('Fleet shows local replica health and transitions when the primary status is unavailable',async()=>{
+  const h=clusterHarness();h.run('S.status=null');await h.panel.refresh();
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/3 \/ 3/);
+  assert.match(h.nodes.get('#cp-meta').innerHTML,/View from Host 2/);
+  assert.match(h.nodes.get('#cp-replicas').innerHTML,/https:\/\/cp-3.example.test\/#\/fleet/);
+  assert.match(h.nodes.get('#cp-transitions').innerHTML,/Host 1/);
+});
+await check('an unreachable former primary is not displayed as the current primary',async()=>{
+  const h=clusterHarness();h.cluster.replicas[0].reachable=false;await h.panel.refresh();
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/No primary is ready/);
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/2 \/ 3/);
+  assert.match(h.nodes.get('#cp-replicas').innerHTML,/Last seen: primary/);
+});
+await check('a failed replica refresh retains history but marks current health unknown',async()=>{
+  const h=clusterHarness();await h.panel.refresh();
+  h.context.fetch=async()=>{throw Error('offline');};await h.panel.refresh();
+  assert.match(h.nodes.get('#cp-meta').innerHTML,/Showing the last received view/);
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/Unknown/);
+  assert.doesNotMatch(h.nodes.get('#cp-replicas').innerHTML,/>Healthy</);
+  assert.match(h.nodes.get('#cp-transitions').innerHTML,/Host 1/);
+});
+await check('leaving Fleet aborts a pending replica request and prevents late rendering',async()=>{
+  const h=clusterHarness(),d=deferred();let signal;
+  h.context.fetch=async(_path,options)=>{signal=options.signal;return d.promise;};
+  const loading=h.panel.refresh();h.panel.unmount();
+  assert.equal(signal.aborted,true);h.nodes.get('#cp-summary').innerHTML='next page';
+  d.resolve(Response.json(h.cluster));await loading;
+  assert.equal(h.nodes.get('#cp-summary').innerHTML,'next page');
+});
+await check('a standalone controller displays without requesting Raft diagnostics',async()=>{
+  const h=clusterHarness();h.run('S.status.controlPlane={name:"Local controller",runtime:"docker"}');
+  h.context.fetch=async()=>{throw Error('must not request a cluster');};await h.panel.refresh();
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/Local controller/);
+  assert.equal(h.nodes.get('#cp-history').hidden,true);
+  assert.doesNotMatch(h.nodes.get('#cp-meta').innerHTML,/unavailable/);
+});
+console.log(`${passed} UI lifecycle and current-health regressions passed.`);
