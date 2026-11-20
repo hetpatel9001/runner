@@ -7,7 +7,7 @@ run-name: ${{ inputs.refill_slot && format('Machine schedule (refill {0})', inpu
 # minute lists make each account's phase visible when reviewing the workflow.
 on:
   schedule:
-    - cron: "2,12,22,32,42,52 * * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
   # Empty input previews; provider mode requires a fresh UTC refill slot.
   workflow_dispatch:
     inputs:
