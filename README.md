@@ -39,7 +39,7 @@ apps. The [Mac guide](docs/mac-control.md) includes startup supervision, persist
 You need Docker Compose, an active domain on Cloudflare and either a scoped Cloudflare API token or a Global API Key plus the account email. The setup discovers the account/zone IDs, generates fleet credentials and creates the control-plane tunnel.
 
 ```sh
-git clone https://github.com/hetp4401/runner.git
+git clone https://github.com/hetpatel9001/runner.git
 cd runner
 cp .env.example .env
 chmod 600 .env

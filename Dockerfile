@@ -1,4 +1,2 @@
-# Native Rust release, tested on Linux amd64 and arm64.
-# Source revision: a7ab78db9e50a062c1db412140760d251e50a445
-# Rebuild native sources with .github/workflows/rust.yml before changing this pin.
-FROM ghcr.io/hetp4401/runner/control@sha256:001cf0cb1903b816c8e9221ff1cfc4f23b2c002e92b78f1e1ed7e5e441915795
+# Tested native release built by this repository.
+FROM ghcr.io/hetpatel9001/runner/control@sha256:13da73cf2b4865fd5e2b9b63e1fda90397016134141d726f317a715acdc1f7aa

@@ -1,0 +1,8 @@
+{
+  "repo": "hetpatel9001/runner",
+  "runtimeRevision": "a629408870152fd5e2895ee7526b10da28e9e241",
+  "sourceRevision": "0bfb6c221af1a4227245181f499e45f9afa1e226",
+  "runtimeImage": "ghcr.io/hetpatel9001/runner/control@sha256:13da73cf2b4865fd5e2b9b63e1fda90397016134141d726f317a715acdc1f7aa",
+  "providerImage": "ghcr.io/hetpatel9001/runner/fleet-provider@sha256:42bf7900f7d3946342b3a87d4e50db0fb72378b95ed2a95094430ddf68cdbae4",
+  "validationRun": "https://github.com/hetpatel9001/runner/actions/runs/44786023852"
+}

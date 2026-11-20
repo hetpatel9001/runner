@@ -1,7 +1,7 @@
-FROM ghcr.io/hetp4401/runner/control@sha256:07e089137604b1b6279f291c69043fbd398a97790081d9baf38a2b414bfd4f45 AS native
+FROM ghcr.io/hetpatel9001/runner/control@sha256:13da73cf2b4865fd5e2b9b63e1fda90397016134141d726f317a715acdc1f7aa AS native
 FROM docker:28-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d AS docker
 FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS base
-LABEL org.opencontainers.image.source="https://github.com/hetp4401/runner"
+LABEL org.opencontainers.image.source="https://github.com/hetpatel9001/runner"
 COPY --from=native /usr/local/share/runner-agent/rust/manifest.json /native/manifest.json
 COPY --from=native /usr/local/share/runner-agent/rust/runner-agent-linux-amd64 /native/runner-agent-linux-amd64
 COPY --from=native /usr/local/share/runner-agent/rust/runner-agent-linux-arm64 /native/runner-agent-linux-arm64

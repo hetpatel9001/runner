@@ -14,6 +14,7 @@ on:
 permissions:
   actions: read # verify the scheduled origin; machine jobs cannot dispatch hosts
   contents: read
+  packages: read # this repository's pinned native runtime
 
 jobs:
   agent:
@@ -24,7 +25,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          repository: ${{ vars.AGENT_REPO || github.repository }} # another account's copy runs this repo's agent (README: Another GitHub account)
           persist-credentials: false # the agent never uses git, so the job's token needn't be left on disk for the apps to find
 
       - name: Verify capacity origin
@@ -32,6 +32,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SCHEDULE_RUN: ${{ inputs.schedule_run }}
         run: node .github/scripts/verify-schedule.mjs
+
+      - name: Pull this repository's native runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image=$(cat rust/runtime-image)
+          expected="ghcr.io/${GITHUB_REPOSITORY,,}/control@sha256:"
+          [[ "$image" == "$expected"* && "${image#"$expected"}" =~ ^[a-f0-9]{64}$ ]] || {
+            echo "::error::rust/runtime-image must pin this repository's tested runtime digest"
+            exit 1
+          }
+          runtime_auth=$(mktemp -d)
+          trap 'rm -rf "$runtime_auth"' EXIT
+          printf '%s' "$GH_TOKEN" | docker --config "$runtime_auth" login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker --config "$runtime_auth" pull "$image"
 
       - name: Agent
         id: agent

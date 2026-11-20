@@ -14,7 +14,7 @@ cargo test --locked --workspace
 cargo build --locked --release -p runner-control -p runner-agent -p runner-raft
 ```
 
-The `Rust runtime` workflow builds and tests static Linux amd64 and arm64 binaries on native GitHub runners. It publishes versioned `control` and `agent` images under `ghcr.io/hetp4401/runner`. The controller uses a scratch image, with certificates, Cloudflare's connector, and verified agent downloads. The static official etcd Raft helper is included; no compiler or Node process runs in the container. The agent image contains its binary and Docker CLI. The old JavaScript download endpoints remain available during migration.
+The `Rust runtime` workflow builds and tests static Linux amd64 and arm64 binaries on native GitHub runners. It publishes versioned `control` and `agent` images under `ghcr.io/hetpatel9001/runner`. The controller uses a scratch image, with certificates, Cloudflare's connector, and verified agent downloads. The static official etcd Raft helper is included; no compiler or Node process runs in the container. The agent image contains its binary and Docker CLI. The old JavaScript download endpoints remain available during migration.
 
 The controller image preserves UID 1000, `/data`, and the existing environment settings. `start`, `init`, `credentials`, `healthcheck`, and `--version` are native commands. Initialization is explicit; a missing configuration database never silently creates an empty fleet. Consensus bootstrap remains explicit through the compatible `/_cp/bootstrap` API and existing `control/cluster-init.mjs` operator tool.
 
